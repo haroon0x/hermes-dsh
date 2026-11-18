@@ -161,6 +161,28 @@ class TestSdkSessions(DshTestCase):
         self.assertEqual(out["pending_questions"][0]["answer"], "cancelled")
         self.assertIn("asked the user a question", out["guidance"])
 
+    def test_events_cursor_replays_and_advances(self):
+        sid = self.start_session()
+        _call("prompt", session_id=sid, task="hello")
+        first = _call("events", session_id=sid, since_seq=0)
+        self.assertTrue(first["ok"], first)
+        self.assertGreater(first["next_seq"], 0)
+        self.assertTrue(first["events"])
+        second = _call("events", session_id=sid, since_seq=first["next_seq"])
+        self.assertEqual(second["events"], [])
+        self.assertEqual(second["next_seq"], first["next_seq"])
+
+
+class TestCleanup(DshTestCase):
+    def test_shutdown_all_stops_runtimes_and_forgets_sessions(self):
+        sid = self.start_session()
+        _call("prompt", session_id=sid, task="hello")
+        plugin._shutdown_all()
+        self.assertEqual(plugin._SERVERS, {})
+        self.assertEqual(plugin._SESSIONS, {})
+        gone = _call("events", session_id=sid, since_seq=0)
+        self.assertFalse(gone["ok"])
+
 
 class TestFanout(DshTestCase):
     def test_runs_agents_in_parallel_and_reports_each(self):
@@ -189,6 +211,15 @@ class TestFanout(DshTestCase):
         out = _call("fanout", tasks=["  "])
         self.assertFalse(out["ok"])
         self.assertIn("empty task", out["error"])
+
+    def test_per_task_route_overrides(self):
+        out = _call("fanout", cwd=self.tmp, tasks=[
+            {"task": "one", "provider": "deepseek-official", "model": "deepseek-chat"},
+            {"task": "two"},
+        ])
+        self.assertTrue(out["ok"], out)
+        routes = {(r["provider"], r["model"]) for r in out["results"]}
+        self.assertIn(("deepseek-official", "deepseek-chat"), routes)
 
 
 if __name__ == "__main__":

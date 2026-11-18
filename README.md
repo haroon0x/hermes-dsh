@@ -3,9 +3,9 @@
 Hermes plugin that drives [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)
 (`dsh`) agents. Two tools:
 
-- **`dsh_agent`** — one-shot. Spawns `dsh --profile headless --json`, parses the
+- **`dsh_agent`**: one-shot. Spawns `dsh --profile headless --json`, parses the
   NDJSON run events, returns the final answer plus the dsh session id.
-- **`dsh_session`** — live control over `dsh --profile sdk`, dsh's newline-delimited
+- **`dsh_session`**: live control over `dsh --profile sdk`, dsh's newline-delimited
   JSON-RPC runtime (server identity `deepseek-harness-sdk-runtime`). Start a
   session, prompt it, stream its reasoning/tool calls, answer approvals, change
   the working directory, resume a persisted session, shut it down.
@@ -71,6 +71,7 @@ partial answer with `timed_out: true`.
 | `start` | new session in `cwd` → `session_id` |
 | `prompt` | send a turn, wait for `turn/end`, return the answer and tool calls |
 | `fanout` | run several independent agents in parallel from one call |
+| `events` | read a session's event stream since `since_seq` |
 | `resume` | reattach a persisted dsh session id after a restart |
 | `cwd` | read the session directory, or change it with `path` |
 | `list` | live sessions and their status |
@@ -84,20 +85,21 @@ and approval decisions.
 
 `approval` decides what happens when dsh asks to escalate its sandbox:
 
-- `ask` (default) — refuse the escalation, record it in `pending_approvals`, and
+- `ask` (default): refuse the escalation, record it in `pending_approvals`, and
   return guidance. Nothing runs; the model puts the request to the user and can
   retry with `allow` if they agree.
-- `allow` — grant `allowed-once` for that operation.
-- `reject` — refuse.
+- `allow`: grant `allowed-once` for that operation.
+- `reject`: refuse.
 
 Grants never persist beyond the operation, and this plugin never auto-approves.
 
 ### User questions
 
-dsh's `ask_user_question` goes to whoever drives the runtime — here, Hermes, not
-a person. The plugin answers `{cancelled: true}` (dismissal is never permission)
-and returns the question in `pending_questions` with guidance. The Hermes model
-puts it to you and sends your answer as the next prompt on that session.
+dsh's `ask_user_question` goes to whoever drives the runtime, which here is
+Hermes, not a person. The plugin answers `{cancelled: true}` (dismissal is never
+permission) and returns the question in `pending_questions` with guidance. The
+Hermes model puts it to you and sends your answer as the next prompt on that
+session.
 
 ## Orchestrating several agents
 
@@ -114,10 +116,26 @@ Each result carries its own `session_id`, `text`, `tool_calls` and `approvals`, 
 you can keep talking to any of them with `prompt`, compare answers, or feed one
 agent's output into another. `max_parallel` caps concurrency (default 4, max 8).
 Entries can be `{task, cwd}` objects when agents should work in different
-directories.
+directories, and may carry `provider`, `model` or `reasoning_effort` to run one
+task on a different route (cheap model for bulk work, strong model for review).
 
 Approvals are tracked per session: one agent's escalation never grants another
 agent's operation.
+
+## Watching progress
+
+`prompt` waits for the turn to end, which hides everything until it does. To
+watch a long run, call `events` with a cursor:
+
+```
+dsh_session(action="events", session_id=..., since_seq=0)
+# -> events: [...], next_seq: 42, status: "working"
+dsh_session(action="events", session_id=..., since_seq=42)
+```
+
+Events are dsh's own stream (`turn/start`, `step/start`, `tool/call`,
+`tool/result`, `assistant/message`, `turn/end`). Idle runtimes shut down after
+15 minutes by default; set `idle_timeout_s` (0 disables) in the plugin settings.
 
 ## Limitations
 

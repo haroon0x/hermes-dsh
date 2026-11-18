@@ -1,15 +1,17 @@
-"""dsh plugin — run DeepSeek Harness agents from Hermes.
+"""dsh plugin: run DeepSeek Harness agents from Hermes.
 
-Registers one tool, ``dsh_agent``, that spawns
-``dsh --profile headless --json "<task>"`` in a working directory, parses the
-NDJSON run events, and returns the final answer plus the dsh session id so a
-follow-up call can resume the same agent session.
+Registers two tools: ``dsh_agent``, a one-shot run over
+``dsh --profile headless --json``, and ``dsh_session``, live control over
+``dsh --profile sdk`` (JSON-RPC) with sessions, streaming events, approvals,
+parallel fanout, and resumable ids.
 
-The dsh profile owns the model route; this plugin never passes a model.
+The dsh profile owns the model route; this plugin only overrides it when a
+caller passes provider/model explicitly.
 """
 
 from __future__ import annotations
 
+import atexit
 import glob
 import json
 import os
@@ -264,7 +266,7 @@ SDK_SCHEMA = {
     "name": "dsh_session",
     "description": (
         "Control a live DeepSeek Harness (dsh) agent session over dsh's SDK "
-        "protocol — the same runtime the dsh UI drives. Actions: start a "
+        "protocol, the same runtime the dsh UI drives. Actions: start a "
         "session, prompt it (streams its reasoning/tool calls and returns the "
         "answer), resume a persisted session, read or change its working "
         "directory, list live sessions, or shut the runtime down. Use this "
@@ -276,12 +278,18 @@ SDK_SCHEMA = {
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["start", "prompt", "fanout", "resume", "cwd", "list", "shutdown"],
+                "enum": ["start", "prompt", "fanout", "events", "resume", "cwd", "list", "shutdown"],
                 "description": "start: new session. prompt: send a turn and wait. "
                                "fanout: run several independent dsh agents in parallel. "
+                               "events: read a session's event stream since a cursor. "
                                "resume: reattach a persisted dsh session id. cwd: read "
                                "(no path) or change (path) the session directory. "
                                "list: live sessions. shutdown: stop the runtime.",
+            },
+            "since_seq": {
+                "type": "integer",
+                "description": "For action=events: return events with seq greater than this. "
+                               "Pass the previous call's next_seq to poll for progress.",
             },
             "tasks": {
                 "type": "array",
@@ -379,6 +387,7 @@ class _SdkServer:
         self._stderr: list[str] = []
         self._dead = False
         self._dead_reason = ""
+        self.last_used = time.time()
 
         binary = _find_dsh()
         if not binary:
@@ -573,6 +582,7 @@ class _SdkServer:
         with self._session_locks_guard:
             session_lock = self._session_locks.setdefault(session_id, threading.Lock())
         with session_lock:
+            self.last_used = time.time()
             self._approval_modes[session_id] = approval
             with self._event_lock:
                 self.approvals = [a for a in self.approvals if a.get("session_id") != session_id]
@@ -683,7 +693,14 @@ class _SdkServer:
             "stderr_tail": "\n".join(self._stderr[-10:]) or None,
         }
 
+    def busy(self) -> bool:
+        with self._session_locks_guard:
+            locks = list(self._session_locks.values())
+        return any(lock.locked() for lock in locks)
+
     def shutdown(self) -> None:
+        if self._dead:
+            return
         try:
             self.request("shutdown", None, timeout=15)
         except _SdkError:
@@ -706,6 +723,54 @@ class _SdkServer:
 _SERVERS: dict[tuple[str, str, str], _SdkServer] = {}
 _SESSIONS: dict[str, dict[str, Any]] = {}
 _SDK_LOCK = threading.Lock()
+_IDLE_TIMEOUT = 900
+_REAPER_STARTED = False
+
+
+def _shutdown_all() -> None:
+    with _SDK_LOCK:
+        servers = list(_SERVERS.values())
+        _SERVERS.clear()
+        _SESSIONS.clear()
+    for server in servers:
+        try:
+            server.shutdown()
+        except Exception:
+            pass
+
+
+def _reap_idle() -> None:
+    while True:
+        time.sleep(60)
+        if _IDLE_TIMEOUT <= 0:
+            continue
+        now = time.time()
+        with _SDK_LOCK:
+            stale = [key for key, server in _SERVERS.items()
+                     if not server.busy() and now - server.last_used > _IDLE_TIMEOUT]
+        for key in stale:
+            with _SDK_LOCK:
+                server = _SERVERS.pop(key, None)
+            if server is None:
+                continue
+            try:
+                server.shutdown()
+            except Exception:
+                pass
+            with _SDK_LOCK:
+                for sid in [s for s, r in _SESSIONS.items() if tuple(r["server"]) == key]:
+                    _SESSIONS.pop(sid, None)
+
+
+def _ensure_reaper() -> None:
+    global _REAPER_STARTED
+    if _REAPER_STARTED or _IDLE_TIMEOUT <= 0:
+        return
+    _REAPER_STARTED = True
+    threading.Thread(target=_reap_idle, daemon=True, name="dsh-idle-reaper").start()
+
+
+atexit.register(_shutdown_all)
 
 
 def _server_for(provider: str, model: str, effort: str, cwd: str) -> _SdkServer:
@@ -714,6 +779,7 @@ def _server_for(provider: str, model: str, effort: str, cwd: str) -> _SdkServer:
     if server is None or server._dead:
         server = _SdkServer(provider, model, effort, cwd)
         _SERVERS[key] = server
+        _ensure_reaper()
     return server
 
 
@@ -798,7 +864,10 @@ def handle_dsh_session(args: dict[str, Any], **_kw) -> str:
                     return _result(ok=False, error=f"tasks[{index}] has an empty task")
                 if not os.path.isdir(item_cwd):
                     return _result(ok=False, error=f"tasks[{index}] cwd does not exist: {item_cwd}")
-                info = _new_session(provider, model, effort, item_cwd)
+                item_provider = str(item.get("provider") or provider) if isinstance(item, dict) else provider
+                item_model = str(item.get("model") or model) if isinstance(item, dict) else model
+                item_effort = str(item.get("reasoning_effort") or effort) if isinstance(item, dict) else effort
+                info = _new_session(item_provider, item_model, item_effort, item_cwd)
                 prepared.append((info["session_id"], task_text.strip()))
             try:
                 max_parallel = int(args.get("max_parallel") or 4)
@@ -820,6 +889,29 @@ def handle_dsh_session(args: dict[str, Any], **_kw) -> str:
                            results=results, agents=len(results),
                            failed=sum(1 for r in results if not r.get("ok")),
                            max_parallel=max_parallel, provider=provider, model=model)
+
+        if action == "events":
+            if not session_id:
+                return _result(ok=False, error="session_id is required for events")
+            with _SDK_LOCK:
+                record = _SESSIONS.get(session_id)
+            if record is None:
+                return _result(ok=False, error=f"unknown session {session_id!r}")
+            server = _SERVERS.get(tuple(record["server"]))
+            if server is None or server._dead:
+                return _result(ok=False, error="dsh runtime for this session is gone")
+            try:
+                since = int(args.get("since_seq") or 0)
+            except (TypeError, ValueError):
+                since = 0
+            with server._event_lock:
+                raw = list(server._events.get(session_id, []))
+                status = server._status.get(session_id)
+            fresh = [e for e in raw if int(e.get("seq") or 0) > since]
+            next_seq = int(raw[-1].get("seq") or 0) if raw else since
+            return _result(ok=True, action="events", session_id=session_id,
+                           events=fresh[:200], next_seq=next_seq, status=status,
+                           truncated=len(fresh) > 200)
 
         if action == "resume":
             if not session_id:
@@ -887,10 +979,14 @@ def handle_dsh_session(args: dict[str, Any], **_kw) -> str:
 
 
 def register(ctx) -> None:
-    global _DEFAULT_PROVIDER, _DEFAULT_MODEL, _DEFAULT_EFFORT
+    global _DEFAULT_PROVIDER, _DEFAULT_MODEL, _DEFAULT_EFFORT, _IDLE_TIMEOUT
     _DEFAULT_PROVIDER = str(ctx.get_config("route.provider", _DEFAULT_PROVIDER) or _DEFAULT_PROVIDER)
     _DEFAULT_MODEL = str(ctx.get_config("route.model", _DEFAULT_MODEL) or _DEFAULT_MODEL)
     _DEFAULT_EFFORT = str(ctx.get_config("route.reasoning_effort", _DEFAULT_EFFORT) or _DEFAULT_EFFORT)
+    try:
+        _IDLE_TIMEOUT = max(0, min(86400, int(ctx.get_config("idle_timeout_s", _IDLE_TIMEOUT))))
+    except (TypeError, ValueError):
+        pass
     ctx.register_tool(
         name="dsh_agent",
         toolset="dsh",
