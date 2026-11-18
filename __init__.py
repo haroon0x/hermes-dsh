@@ -18,6 +18,7 @@ import subprocess
 import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 _MAX_TEXT = 40_000
@@ -275,11 +276,29 @@ SDK_SCHEMA = {
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["start", "prompt", "resume", "cwd", "list", "shutdown"],
+                "enum": ["start", "prompt", "fanout", "resume", "cwd", "list", "shutdown"],
                 "description": "start: new session. prompt: send a turn and wait. "
+                               "fanout: run several independent dsh agents in parallel. "
                                "resume: reattach a persisted dsh session id. cwd: read "
                                "(no path) or change (path) the session directory. "
                                "list: live sessions. shutdown: stop the runtime.",
+            },
+            "tasks": {
+                "type": "array",
+                "description": "For action=fanout: one entry per agent. Each entry is a "
+                               "task string, or an object with task and optional cwd.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "task": {"type": "string"},
+                        "cwd": {"type": "string"},
+                    },
+                    "required": ["task"],
+                },
+            },
+            "max_parallel": {
+                "type": "integer",
+                "description": "For action=fanout: how many agents run at once. Default 4, max 8.",
             },
             "session_id": {
                 "type": "string",
@@ -345,8 +364,12 @@ class _SdkServer:
         self.model = model
         self.reasoning_effort = reasoning_effort
         self.cwd = cwd
-        self.approval = "allow"
+        self.approval = "ask"
         self.approvals: list[dict[str, Any]] = []
+        self._approval_modes: dict[str, str] = {}
+        self._event_lock = threading.Lock()
+        self._session_locks: dict[str, threading.Lock] = {}
+        self._session_locks_guard = threading.Lock()
         self._pending: dict[int, dict[str, Any]] = {}
         self._lock = threading.Lock()
         self._id = 0
@@ -441,29 +464,33 @@ class _SdkServer:
         if method == "session.event":
             event = params.get("event") or {}
             if sid:
-                self._events.setdefault(sid, []).append(event)
+                with self._event_lock:
+                    self._events.setdefault(sid, []).append(event)
         elif method == "session.status":
             if sid:
-                self._status[sid] = str(params.get("status") or "")
+                with self._event_lock:
+                    self._status[sid] = str(params.get("status") or "")
 
     def _answer_server_request(self, msg: dict[str, Any]) -> None:
         method = msg.get("method")
         if method == "approval/request":
             params = msg.get("params") or {}
-            mode = self.approval
+            sid = str(params.get("sessionId") or "")
+            mode = self._approval_modes.get(sid, "ask")
             if mode == "allow":
                 outcome, decision = "allowed-once", "allowed"
             else:
                 # "ask" and "reject" both refuse here. "ask" records the request so
                 # the model can put it to the user and retry with approval=allow.
                 outcome, decision = "rejected", ("needs-user" if mode == "ask" else "rejected")
-            self.approvals.append({
-                "session_id": params.get("sessionId"),
-                "tool": params.get("toolName"),
-                "reason": params.get("reason"),
-                "outcome": outcome,
-                "decision": decision,
-            })
+            with self._event_lock:
+                self.approvals.append({
+                    "session_id": sid,
+                    "tool": params.get("toolName"),
+                    "reason": params.get("reason"),
+                    "outcome": outcome,
+                    "decision": decision,
+                })
             result: dict[str, Any] = {"outcome": outcome}
         elif method == "user-question/ask":
             # No interactive user in this path; dismissal is never approval.
@@ -532,46 +559,53 @@ class _SdkServer:
         return str((res or {}).get("cwd") or "")
 
     def prompt(self, session_id: str, text: str, timeout: float, approval: str = "ask") -> dict[str, Any]:
-        self.approval = approval
-        self.approvals = []
-        before = len(self._events.setdefault(session_id, []))
-        receipt = self.request("session/prompt", {
-            "sessionId": session_id,
-            "contentBlocks": [{"type": "text", "text": text}],
-        }, timeout=60)
-        message_id = str((receipt or {}).get("messageId") or "")
+        with self._session_locks_guard:
+            session_lock = self._session_locks.setdefault(session_id, threading.Lock())
+        with session_lock:
+            self._approval_modes[session_id] = approval
+            with self._event_lock:
+                self.approvals = [a for a in self.approvals if a.get("session_id") != session_id]
+                before = len(self._events.setdefault(session_id, []))
+            receipt = self.request("session/prompt", {
+                "sessionId": session_id,
+                "contentBlocks": [{"type": "text", "text": text}],
+            }, timeout=60)
+            message_id = str((receipt or {}).get("messageId") or "")
 
-        deadline = time.monotonic() + timeout
-        user_seq = None
-        timed_out = False
-        while True:
-            events = self._events.get(session_id, [])[before:]
-            if user_seq is None:
-                for ev in events:
-                    data = ev.get("data") or {}
-                    if ev.get("type") == "user/message" and (
-                            not message_id or data.get("id") == message_id):
-                        user_seq = int(ev.get("seq") or 0)
-                        break
-            finished = False
-            if user_seq is not None:
-                for ev in events:
-                    if ev.get("type") == "turn/end" and int(ev.get("seq") or 0) > user_seq:
-                        finished = True
-                        break
-            if finished:
-                break
-            if self._dead:
-                break
-            if time.monotonic() > deadline:
-                timed_out = True
-                break
-            time.sleep(0.25)
+            deadline = time.monotonic() + timeout
+            user_seq = None
+            timed_out = False
+            while True:
+                with self._event_lock:
+                    events = list(self._events.get(session_id, [])[before:])
+                if user_seq is None:
+                    for ev in events:
+                        data = ev.get("data") or {}
+                        if ev.get("type") == "user/message" and (
+                                not message_id or data.get("id") == message_id):
+                            user_seq = int(ev.get("seq") or 0)
+                            break
+                finished = False
+                if user_seq is not None:
+                    for ev in events:
+                        if ev.get("type") == "turn/end" and int(ev.get("seq") or 0) > user_seq:
+                            finished = True
+                            break
+                if finished:
+                    break
+                if self._dead:
+                    break
+                if time.monotonic() > deadline:
+                    timed_out = True
+                    break
+                time.sleep(0.25)
 
-        return self._summarize(session_id, before, timed_out)
+            return self._summarize(session_id, before, timed_out)
 
     def _summarize(self, session_id: str, before: int, timed_out: bool) -> dict[str, Any]:
-        events = self._events.get(session_id, [])[before:]
+        with self._event_lock:
+            events = list(self._events.get(session_id, [])[before:])
+            approvals = [a for a in self.approvals if a.get("session_id") == session_id]
         answer = ""
         reasoning_chars = 0
         tool_calls: list[dict[str, Any]] = []
@@ -600,7 +634,7 @@ class _SdkServer:
                 turns += 1
         if len(answer) > _MAX_TEXT:
             answer = answer[:_MAX_TEXT] + f"\n… [truncated {len(answer) - _MAX_TEXT} chars]"
-        pending = [a for a in self.approvals if a.get("decision") == "needs-user"]
+        pending = [a for a in approvals if a.get("decision") == "needs-user"]
         guidance = None
         if pending:
             tools = ", ".join(sorted({str(a.get("tool")) for a in pending}))
@@ -618,7 +652,7 @@ class _SdkServer:
             "tool_calls": tool_calls[:50],
             "tool_call_count": len(tool_calls),
             "reasoning_chars": reasoning_chars,
-            "approvals": list(self.approvals),
+            "approvals": approvals,
             "pending_approvals": pending,
             "guidance": guidance,
             "events": len(events),
@@ -662,6 +696,46 @@ def _server_for(provider: str, model: str, effort: str, cwd: str) -> _SdkServer:
     return server
 
 
+def _prompt_result(session_id: str, task: str, timeout_s: int, approval: str) -> dict[str, Any]:
+    with _SDK_LOCK:
+        record = _SESSIONS.get(session_id)
+    if record is None:
+        return {"ok": False, "session_id": session_id,
+                "error": f"unknown session {session_id!r}; start or resume it first"}
+    server = _SERVERS.get(tuple(record["server"]))
+    if server is None or server._dead:
+        return {"ok": False, "session_id": session_id,
+                "error": "dsh runtime for this session is gone; start a new session"}
+    summary = server.prompt(session_id, task, timeout_s, approval)
+    record["cwd"] = summary.get("cwd") or record["cwd"]
+    return {"ok": not summary.get("timed_out"),
+            "error": "timed out; partial result" if summary.get("timed_out") else None,
+            "action": "prompt", **summary}
+
+
+def _new_session(provider: str, model: str, effort: str, cwd: str) -> dict[str, Any]:
+    server = _server_for(provider, model, effort, cwd)
+    session_id = f"hermes-{uuid.uuid4()}"
+    server.open_session(session_id, cwd)
+    with _SDK_LOCK:
+        _SESSIONS[session_id] = {"server": (provider, model, effort), "cwd": cwd,
+                                 "created": time.time()}
+    return {"session_id": session_id, "cwd": server.get_cwd(session_id) or cwd}
+
+
+def _timeout_arg(args: dict[str, Any]) -> int:
+    try:
+        value = int(args.get("timeout_s") or 600)
+    except (TypeError, ValueError):
+        value = 600
+    return max(10, min(1800, value))
+
+
+def _approval_arg(args: dict[str, Any]) -> str:
+    value = str(args.get("approval") or "ask").strip().lower()
+    return value if value in {"ask", "allow", "reject"} else "ask"
+
+
 def handle_dsh_session(args: dict[str, Any], **_kw) -> str:
     action = str(args.get("action") or "").strip().lower()
     provider = str(args.get("provider") or _DEFAULT_PROVIDER)
@@ -671,103 +745,120 @@ def handle_dsh_session(args: dict[str, Any], **_kw) -> str:
     session_id = str(args.get("session_id") or "").strip()
 
     try:
-        with _SDK_LOCK:
-            if action == "start":
-                if not os.path.isdir(cwd):
-                    return _result(ok=False, error=f"cwd does not exist: {cwd}")
-                server = _server_for(provider, model, effort, cwd)
-                session_id = f"hermes-{uuid.uuid4()}"
-                server.open_session(session_id, cwd)
-                _SESSIONS[session_id] = {
-                    "server": (provider, model, effort), "cwd": cwd,
-                    "created": time.time(),
-                }
-                return _result(ok=True, action="start", session_id=session_id,
-                               cwd=server.get_cwd(session_id) or cwd,
-                               provider=provider, model=model, reasoning_effort=effort)
+        if action == "start":
+            if not os.path.isdir(cwd):
+                return _result(ok=False, error=f"cwd does not exist: {cwd}")
+            info = _new_session(provider, model, effort, cwd)
+            return _result(ok=True, action="start", provider=provider, model=model,
+                           reasoning_effort=effort, **info)
 
-            if action == "resume":
-                if not session_id:
-                    return _result(ok=False, error="session_id is required for resume")
-                server = _server_for(provider, model, effort, cwd)
-                server.resume_session(session_id)
-                _SESSIONS[session_id] = {
-                    "server": (provider, model, effort), "cwd": cwd,
-                    "created": time.time(),
-                }
-                return _result(ok=True, action="resume", session_id=session_id,
-                               cwd=server.get_cwd(session_id) or cwd)
+        if action == "prompt":
+            if not session_id:
+                return _result(ok=False, error="session_id is required for prompt")
+            task = str(args.get("task") or "").strip()
+            if not task:
+                return _result(ok=False, error="task is required for prompt")
+            return _result(**_prompt_result(session_id, task, _timeout_arg(args), _approval_arg(args)))
 
-            if action == "prompt":
-                if not session_id:
-                    return _result(ok=False, error="session_id is required for prompt")
-                task = str(args.get("task") or "").strip()
-                if not task:
-                    return _result(ok=False, error="task is required for prompt")
+        if action == "fanout":
+            tasks = args.get("tasks")
+            if not isinstance(tasks, list) or not tasks:
+                return _result(ok=False, error="tasks is required for fanout (a non-empty list)")
+            prepared: list[tuple[str, str]] = []
+            for index, item in enumerate(tasks):
+                if isinstance(item, str):
+                    task_text, item_cwd = item, cwd
+                elif isinstance(item, dict):
+                    task_text = str(item.get("task") or "")
+                    item_cwd = str(item.get("cwd") or cwd)
+                else:
+                    return _result(ok=False, error=f"tasks[{index}] must be a string or object")
+                if not task_text.strip():
+                    return _result(ok=False, error=f"tasks[{index}] has an empty task")
+                if not os.path.isdir(item_cwd):
+                    return _result(ok=False, error=f"tasks[{index}] cwd does not exist: {item_cwd}")
+                info = _new_session(provider, model, effort, item_cwd)
+                prepared.append((info["session_id"], task_text.strip()))
+            try:
+                max_parallel = int(args.get("max_parallel") or 4)
+            except (TypeError, ValueError):
+                max_parallel = 4
+            max_parallel = max(1, min(8, max_parallel))
+            timeout_s, approval = _timeout_arg(args), _approval_arg(args)
+            results: list[dict[str, Any]] = []
+            with ThreadPoolExecutor(max_workers=min(max_parallel, len(prepared))) as pool:
+                futures = [pool.submit(_prompt_result, sid, task, timeout_s, approval)
+                           for sid, task in prepared]
+                for (sid, _task), future in zip(prepared, futures):
+                    try:
+                        results.append(future.result())
+                    except Exception as exc:  # pragma: no cover - defensive
+                        results.append({"ok": False, "session_id": sid,
+                                        "error": f"{type(exc).__name__}: {exc}"})
+            return _result(ok=all(r.get("ok") for r in results), action="fanout",
+                           results=results, agents=len(results),
+                           failed=sum(1 for r in results if not r.get("ok")),
+                           max_parallel=max_parallel, provider=provider, model=model)
+
+        if action == "resume":
+            if not session_id:
+                return _result(ok=False, error="session_id is required for resume")
+            server = _server_for(provider, model, effort, cwd)
+            server.resume_session(session_id)
+            with _SDK_LOCK:
+                _SESSIONS[session_id] = {"server": (provider, model, effort), "cwd": cwd,
+                                         "created": time.time()}
+            return _result(ok=True, action="resume", session_id=session_id,
+                           cwd=server.get_cwd(session_id) or cwd)
+
+        if action == "cwd":
+            if not session_id:
+                return _result(ok=False, error="session_id is required for cwd")
+            with _SDK_LOCK:
                 record = _SESSIONS.get(session_id)
-                if record is None:
-                    return _result(ok=False, error=f"unknown session {session_id!r}; "
-                                                   "start or resume it first")
-                try:
-                    timeout_s = int(args.get("timeout_s") or 600)
-                except (TypeError, ValueError):
-                    timeout_s = 600
-                timeout_s = max(10, min(1800, timeout_s))
-                approval = str(args.get("approval") or "ask").strip().lower()
-                if approval not in {"ask", "allow", "reject"}:
-                    approval = "ask"
+            if record is None:
+                return _result(ok=False, error=f"unknown session {session_id!r}")
+            server = _SERVERS.get(tuple(record["server"]))
+            if server is None or server._dead:
+                return _result(ok=False, error="dsh runtime for this session is gone")
+            path = str(args.get("path") or "").strip()
+            if path:
+                new_cwd = server.set_cwd(session_id, path)
+                record["cwd"] = new_cwd or record["cwd"]
+                return _result(ok=True, action="cwd", session_id=session_id, cwd=new_cwd)
+            return _result(ok=True, action="cwd", session_id=session_id,
+                           cwd=server.get_cwd(session_id))
+
+        if action == "list":
+            live = []
+            with _SDK_LOCK:
+                sessions = list(_SESSIONS.items())
+                runtimes = len(_SERVERS)
+            for sid, record in sessions:
                 server = _SERVERS.get(tuple(record["server"]))
-                if server is None or server._dead:
-                    return _result(ok=False, error="dsh runtime for this session is gone; "
-                                                   "start a new session")
-                summary = server.prompt(session_id, task, timeout_s, approval)
-                record["cwd"] = summary.get("cwd") or record["cwd"]
-                return _result(ok=not summary.get("timed_out"), action="prompt",
-                               error="timed out; partial result" if summary.get("timed_out") else None,
-                               **summary)
+                live.append({
+                    "session_id": sid,
+                    "cwd": record["cwd"],
+                    "provider": record["server"][0],
+                    "model": record["server"][1],
+                    "status": (server._status.get(sid) if server else "gone"),
+                    "age_s": round(time.time() - record["created"], 1),
+                })
+            return _result(ok=True, action="list", sessions=live, runtimes=runtimes)
 
-            if action == "cwd":
-                if not session_id:
-                    return _result(ok=False, error="session_id is required for cwd")
-                record = _SESSIONS.get(session_id)
-                if record is None:
-                    return _result(ok=False, error=f"unknown session {session_id!r}")
-                server = _SERVERS.get(tuple(record["server"]))
-                if server is None or server._dead:
-                    return _result(ok=False, error="dsh runtime for this session is gone")
-                path = str(args.get("path") or "").strip()
-                if path:
-                    new_cwd = server.set_cwd(session_id, path)
-                    record["cwd"] = new_cwd or record["cwd"]
-                    return _result(ok=True, action="cwd", session_id=session_id, cwd=new_cwd)
-                return _result(ok=True, action="cwd", session_id=session_id,
-                               cwd=server.get_cwd(session_id))
-
-            if action == "list":
-                live = []
-                for sid, record in _SESSIONS.items():
-                    server = _SERVERS.get(tuple(record["server"]))
-                    live.append({
-                        "session_id": sid,
-                        "cwd": record["cwd"],
-                        "provider": record["server"][0],
-                        "model": record["server"][1],
-                        "status": (server._status.get(sid) if server else "gone"),
-                        "age_s": round(time.time() - record["created"], 1),
-                    })
-                return _result(ok=True, action="list", sessions=live,
-                               runtimes=len(_SERVERS))
-
-            if action == "shutdown":
-                closed = 0
-                for server in list(_SERVERS.values()):
-                    server.shutdown()
-                    closed += 1
+        if action == "shutdown":
+            with _SDK_LOCK:
+                servers = list(_SERVERS.values())
+            closed = 0
+            for server in servers:
+                server.shutdown()
+                closed += 1
+            with _SDK_LOCK:
                 _SERVERS.clear()
                 _SESSIONS.clear()
-                return _result(ok=True, action="shutdown", runtimes_closed=closed)
+            return _result(ok=True, action="shutdown", runtimes_closed=closed)
 
-            return _result(ok=False, error=f"unknown action {action!r}")
+        return _result(ok=False, error=f"unknown action {action!r}")
     except _SdkError as exc:
         return _result(ok=False, error=str(exc))
     except Exception as exc:  # pragma: no cover - defensive

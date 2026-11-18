@@ -70,6 +70,7 @@ partial answer with `timed_out: true`.
 | --- | --- |
 | `start` | new session in `cwd` → `session_id` |
 | `prompt` | send a turn, wait for `turn/end`, return the answer and tool calls |
+| `fanout` | run several independent agents in parallel from one call |
 | `resume` | reattach a persisted dsh session id after a restart |
 | `cwd` | read the session directory, or change it with `path` |
 | `list` | live sessions and their status |
@@ -93,14 +94,34 @@ Grants never persist beyond the operation, and this plugin never auto-approves.
 `ask_user_question` from dsh is answered `{cancelled: true}` because a tool call
 has no interactive user; the dismissal is not treated as permission.
 
+## Orchestrating several agents
+
+`fanout` starts one session per task and runs them concurrently:
+
+```
+dsh_session(action="fanout",
+            cwd="/abs/repo",
+            max_parallel=3,
+            tasks=["audit auth middleware", "audit payment flow", "audit file uploads"])
+```
+
+Each result carries its own `session_id`, `text`, `tool_calls` and `approvals`, so
+you can keep talking to any of them with `prompt`, compare answers, or feed one
+agent's output into another. `max_parallel` caps concurrency (default 4, max 8).
+Entries can be `{task, cwd}` objects when agents should work in different
+directories.
+
+Approvals are tracked per session: one agent's escalation never grants another
+agent's operation.
+
 ## Limitations
 
 - The SDK protocol has no per-turn cancel. A prompt that times out keeps running
   inside dsh; only `shutdown` stops the runtime (and every session in it).
 - Sessions live in the runtime process. They survive a Hermes restart only via
   `resume` with a persisted dsh session id.
-- Each route (provider/model/effort) gets one runtime; prompts on the same route
-  serialize.
+- Each route (provider/model/effort) gets one runtime; sessions on that route
+  share it and run concurrently, up to `max_parallel` per fanout call.
 - `dsh --profile web` is a long-running browser UI server and is not a valid
   target. The SDK is dsh's automation surface; the web `/api` is the UI's own
   transport behind a browser-trust fence.

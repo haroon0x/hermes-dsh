@@ -154,5 +154,34 @@ class TestSdkSessions(DshTestCase):
         self.assertEqual(out["approvals"][0]["decision"], "rejected")
 
 
+class TestFanout(DshTestCase):
+    def test_runs_agents_in_parallel_and_reports_each(self):
+        out = _call("fanout", cwd=self.tmp, max_parallel=3,
+                    tasks=["one", "two", "three"])
+        self.assertTrue(out["ok"], out)
+        self.assertEqual(out["agents"], 3)
+        self.assertEqual(out["failed"], 0)
+        self.assertEqual([r["text"] for r in out["results"]], ["FAKE_OK"] * 3)
+        self.assertEqual(len({r["session_id"] for r in out["results"]}), 3)
+        listed = _call("list")
+        self.assertEqual(len(listed["sessions"]), 3)
+
+    def test_accepts_objects_with_per_task_cwd(self):
+        out = _call("fanout", tasks=[{"task": "one", "cwd": self.tmp},
+                                     {"task": "two", "cwd": self.tmp}])
+        self.assertTrue(out["ok"], out)
+        self.assertEqual(out["agents"], 2)
+
+    def test_empty_task_list_is_rejected(self):
+        out = _call("fanout", tasks=[])
+        self.assertFalse(out["ok"])
+        self.assertIn("tasks is required", out["error"])
+
+    def test_empty_task_text_is_rejected(self):
+        out = _call("fanout", tasks=["  "])
+        self.assertFalse(out["ok"])
+        self.assertIn("empty task", out["error"])
+
+
 if __name__ == "__main__":
     unittest.main()
