@@ -43,6 +43,8 @@ hermes plugins enable dsh
 ```
 
 The catalog entry is in review ([NousResearch/hermes-agent#157323](https://github.com/NousResearch/hermes-agent/pull/157323)).
+The `owner/repo` form above works today because it installs straight from GitHub;
+the bare name `hermes plugins install dsh` only resolves once that entry merges.
 
 ## 30 seconds
 
