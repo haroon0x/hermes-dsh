@@ -91,8 +91,13 @@ and approval decisions.
 - `reject` — refuse.
 
 Grants never persist beyond the operation, and this plugin never auto-approves.
-`ask_user_question` from dsh is answered `{cancelled: true}` because a tool call
-has no interactive user; the dismissal is not treated as permission.
+
+### User questions
+
+dsh's `ask_user_question` goes to whoever drives the runtime — here, Hermes, not
+a person. The plugin answers `{cancelled: true}` (dismissal is never permission)
+and returns the question in `pending_questions` with guidance. The Hermes model
+puts it to you and sends your answer as the next prompt on that session.
 
 ## Orchestrating several agents
 

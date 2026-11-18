@@ -153,6 +153,14 @@ class TestSdkSessions(DshTestCase):
         self.assertIn("approval=rejected", out["text"])
         self.assertEqual(out["approvals"][0]["decision"], "rejected")
 
+    def test_user_question_is_surfaced_not_answered(self):
+        sid = self.start_session()
+        out = _call("prompt", session_id=sid, task="QUESTION please")
+        self.assertIn("question=cancelled", out["text"])
+        self.assertEqual(len(out["pending_questions"]), 1)
+        self.assertEqual(out["pending_questions"][0]["answer"], "cancelled")
+        self.assertIn("asked the user a question", out["guidance"])
+
 
 class TestFanout(DshTestCase):
     def test_runs_agents_in_parallel_and_reports_each(self):

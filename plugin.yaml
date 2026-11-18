@@ -1,5 +1,5 @@
 name: dsh
-version: 1.1.0
+version: 1.2.0
 description: "Drive DeepSeek Harness (dsh) agents from Hermes: one-shot headless runs and live SDK sessions with streaming tool events, approvals, and resumable sessions."
 author: haroon0x
 kind: standalone

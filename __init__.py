@@ -366,6 +366,7 @@ class _SdkServer:
         self.cwd = cwd
         self.approval = "ask"
         self.approvals: list[dict[str, Any]] = []
+        self.questions: list[dict[str, Any]] = []
         self._approval_modes: dict[str, str] = {}
         self._event_lock = threading.Lock()
         self._session_locks: dict[str, threading.Lock] = {}
@@ -493,7 +494,17 @@ class _SdkServer:
                 })
             result: dict[str, Any] = {"outcome": outcome}
         elif method == "user-question/ask":
-            # No interactive user in this path; dismissal is never approval.
+            # No interactive user exists inside a tool call: record the question so
+            # the model can put it to the user, and answer cancelled (never permission).
+            params = msg.get("params") or {}
+            sid = str(params.get("sessionId") or "")
+            with self._event_lock:
+                self.questions.append({
+                    "session_id": sid,
+                    "request_id": params.get("requestId"),
+                    "questions": params.get("questions") or [],
+                    "answer": "cancelled",
+                })
             result = {"cancelled": True}
         else:
             result = {}
@@ -565,6 +576,7 @@ class _SdkServer:
             self._approval_modes[session_id] = approval
             with self._event_lock:
                 self.approvals = [a for a in self.approvals if a.get("session_id") != session_id]
+                self.questions = [q for q in self.questions if q.get("session_id") != session_id]
                 before = len(self._events.setdefault(session_id, []))
             receipt = self.request("session/prompt", {
                 "sessionId": session_id,
@@ -606,6 +618,7 @@ class _SdkServer:
         with self._event_lock:
             events = list(self._events.get(session_id, [])[before:])
             approvals = [a for a in self.approvals if a.get("session_id") == session_id]
+            questions = [q for q in self.questions if q.get("session_id") == session_id]
         answer = ""
         reasoning_chars = 0
         tool_calls: list[dict[str, Any]] = []
@@ -635,14 +648,21 @@ class _SdkServer:
         if len(answer) > _MAX_TEXT:
             answer = answer[:_MAX_TEXT] + f"\n… [truncated {len(answer) - _MAX_TEXT} chars]"
         pending = [a for a in approvals if a.get("decision") == "needs-user"]
-        guidance = None
+        notes = []
         if pending:
             tools = ", ".join(sorted({str(a.get("tool")) for a in pending}))
-            guidance = (
+            notes.append(
                 f"dsh asked to escalate for {tools}. This call answered rejected because "
                 "approval=ask, so the operation did not run. Put the request to the user; "
                 "if they agree, call dsh_session again with approval='allow'."
             )
+        if questions:
+            notes.append(
+                "dsh asked the user a question; this call answered cancelled, so the agent "
+                "continued without an answer. Ask the user, then send their answer as the "
+                "next prompt on this session."
+            )
+        guidance = "\n".join(notes) or None
         return {
             "text": answer,
             "session_id": session_id,
@@ -654,6 +674,7 @@ class _SdkServer:
             "reasoning_chars": reasoning_chars,
             "approvals": approvals,
             "pending_approvals": pending,
+            "pending_questions": questions,
             "guidance": guidance,
             "events": len(events),
             "cwd": self.cwd,

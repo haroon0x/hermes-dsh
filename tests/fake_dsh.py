@@ -70,9 +70,19 @@ def sdk():
                 answer = sys.stdin.readline()
                 if answer.strip():
                     pending_approval = (json.loads(answer).get("result") or {}).get("outcome")
+            question_cancelled = None
+            if "QUESTION" in text:
+                out({"jsonrpc": "2.0", "id": 901, "method": "user-question/ask",
+                     "params": {"requestId": "q-1", "sessionId": sid,
+                                "questions": [{"id": "q-1", "question": "Which branch?"}]}})
+                answer = sys.stdin.readline()
+                if answer.strip():
+                    question_cancelled = (json.loads(answer).get("result") or {}).get("cancelled")
             answer_text = "FAKE_OK"
             if pending_approval:
                 answer_text += f" approval={pending_approval}"
+            if question_cancelled:
+                answer_text += " question=cancelled"
             out({"jsonrpc": "2.0", "method": "session.event", "params": {
                 "sessionId": sid,
                 "event": {"type": "assistant/message", "seq": 2,
