@@ -38,9 +38,10 @@ plugins:
   entries:
     dsh:
       settings:
-        provider: deepseek-official     # default
-        model: deepseek-chat            # default
-        reasoning_effort: max           # default
+        route:
+          provider: deepseek-official     # default
+          model: deepseek-chat            # default
+          reasoning_effort: max           # default
 ```
 
 These are the route `dsh_session` asks the SDK runtime to use. The headless

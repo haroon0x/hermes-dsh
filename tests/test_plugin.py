@@ -61,8 +61,8 @@ class TestRegistration(DshTestCase):
         self.assertEqual(sorted(self.ctx.tools), ["dsh_agent", "dsh_session"])
 
     def test_settings_override_route_defaults(self):
-        ctx = _Ctx({"provider": "custom-provider", "model": "custom-model",
-                    "reasoning_effort": "low"})
+        ctx = _Ctx({"route.provider": "custom-provider", "route.model": "custom-model",
+                    "route.reasoning_effort": "low"})
         plugin.register(ctx)
         self.assertEqual(plugin._DEFAULT_PROVIDER, "custom-provider")
         self.assertEqual(plugin._DEFAULT_MODEL, "custom-model")

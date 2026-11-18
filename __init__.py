@@ -776,9 +776,9 @@ def handle_dsh_session(args: dict[str, Any], **_kw) -> str:
 
 def register(ctx) -> None:
     global _DEFAULT_PROVIDER, _DEFAULT_MODEL, _DEFAULT_EFFORT
-    _DEFAULT_PROVIDER = str(ctx.get_config("provider", _DEFAULT_PROVIDER) or _DEFAULT_PROVIDER)
-    _DEFAULT_MODEL = str(ctx.get_config("model", _DEFAULT_MODEL) or _DEFAULT_MODEL)
-    _DEFAULT_EFFORT = str(ctx.get_config("reasoning_effort", _DEFAULT_EFFORT) or _DEFAULT_EFFORT)
+    _DEFAULT_PROVIDER = str(ctx.get_config("route.provider", _DEFAULT_PROVIDER) or _DEFAULT_PROVIDER)
+    _DEFAULT_MODEL = str(ctx.get_config("route.model", _DEFAULT_MODEL) or _DEFAULT_MODEL)
+    _DEFAULT_EFFORT = str(ctx.get_config("route.reasoning_effort", _DEFAULT_EFFORT) or _DEFAULT_EFFORT)
     ctx.register_tool(
         name="dsh_agent",
         toolset="dsh",
