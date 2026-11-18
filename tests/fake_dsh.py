@@ -200,8 +200,8 @@ def acp():
                 out(update(sid, "agent_message_chunk",
                            {"content": {"type": "text", "text": extra}}))
             stop = "cancelled" if sid in cancelled else "end_turn"
-            out({"jsonrpc": "2.0", "id": mid, "result": {"stopReason": stop}})
             out(update(sid, "usage_update", {"used": 10, "size": 100}))
+            out({"jsonrpc": "2.0", "id": mid, "result": {"stopReason": stop}})
         else:
             out({"jsonrpc": "2.0", "id": mid,
                  "error": {"code": -32601, "message": f"unknown method {method}"}})
