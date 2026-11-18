@@ -82,23 +82,27 @@ follow-up questions, or feed its answer into another agent.
 
 ## What you get
 
-- **Two modes.** A one-shot run when you just want the answer, a live session
-  when you need turns, approvals, or control.
+- **Two modes.** A one-shot run when you just want the answer, a live ACP
+  session when you need turns, cancel, approvals, or control.
 - **Parallel fanout.** Up to 8 agents per call, each with its own working
   directory, and optionally its own provider/model.
+- **Cancel that works.** `cancel` sends ACP `session/cancel`; the running turn
+  stops and returns `stop_reason: cancelled`. Timeouts cancel too.
 - **Approvals that stay honest.** `ask` is the default: the plugin refuses the
   escalation, returns `pending_approvals`, and lets the model put it to you.
   Nothing is ever auto-approved.
-- **User questions surfaced, not swallowed.** dsh's `ask_user_question` is
-  answered `cancelled` and returned in `pending_questions`, so the model asks
-  you and sends your answer back.
+- **Model config from the session.** `config` reads the provider/model/effort
+  catalog dsh advertises instead of hardcoding a list.
+- **User questions surfaced, not swallowed.** On the SDK transport,
+  `ask_user_question` is answered `cancelled` and returned in
+  `pending_questions`, so the model asks you and sends your answer back.
 - **Progress you can watch.** `events` with a `since_seq` cursor reads dsh's
   stream while a turn is still running.
 - **No leaked processes.** Idle runtimes stop after 15 minutes, and `atexit`
   cleans up when Hermes exits.
 - **Resumable sessions.** Keep the dsh session id and `resume` it after a
   restart.
-- **Offline tests.** 21 tests against a fake `dsh` binary, no key needed.
+- **Offline tests.** 30 tests against a fake `dsh` binary, no key needed.
 
 ## dsh_agent
 
