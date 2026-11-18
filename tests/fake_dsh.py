@@ -110,6 +110,104 @@ def sdk():
     return 0
 
 
+def update(sid, kind, body):
+    payload = {"sessionUpdate": kind}
+    payload.update(body)
+    return {"jsonrpc": "2.0", "method": "session/update",
+            "params": {"sessionId": sid, "update": payload}}
+
+
+def acp():
+    """Minimal ACP server: initialize, sessions, config, prompt, permission, cancel."""
+    sessions = {}
+    configs = {}
+    cancelled = set()
+
+    def config_options(sid):
+        return [
+            {"id": "model", "name": "Model", "type": "select",
+             "currentValue": '["fake","model"]',
+             "options": [{"value": '["fake","model"]', "name": "Fake"},
+                         {"value": '["fake","other"]', "name": "Other"}]},
+            {"id": "reasoning_effort", "name": "Reasoning effort", "type": "select",
+             "currentValue": "high",
+             "options": [{"value": v, "name": v} for v in ("off", "low", "high", "max")]},
+        ]
+
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        msg = json.loads(line)
+        if "method" not in msg:
+            continue
+        method, mid, params = msg.get("method"), msg.get("id"), msg.get("params") or {}
+
+        if method == "session/cancel":
+            cancelled.add(params.get("sessionId"))
+            continue
+        if method == "initialize":
+            out({"jsonrpc": "2.0", "id": mid, "result": {
+                "protocolVersion": 1, "agentCapabilities": {}, "authMethods": []}})
+        elif method == "session/new":
+            sid = f"fake-acp-{len(sessions) + 1}"
+            sessions[sid] = params.get("cwd")
+            configs[sid] = config_options(sid)
+            out({"jsonrpc": "2.0", "id": mid, "result": {
+                "sessionId": sid, "configOptions": configs[sid]}})
+        elif method == "session/set_config_option":
+            sid = params.get("sessionId")
+            for opt in configs.get(sid, []):
+                if opt["id"] == params.get("configId"):
+                    opt["currentValue"] = params.get("value")
+            out({"jsonrpc": "2.0", "id": mid, "result": {
+                "configOptions": configs.get(sid, [])}})
+        elif method == "session/resume":
+            sid = params.get("sessionId")
+            sessions.setdefault(sid, params.get("cwd"))
+            out({"jsonrpc": "2.0", "id": mid, "result": {
+                "configOptions": configs.get(sid, [])}})
+        elif method == "session/prompt":
+            sid = params.get("sessionId")
+            text = "".join(b.get("text", "") for b in params.get("prompt") or [])
+            out(update(sid, "agent_message_chunk",
+                       {"content": {"type": "text", "text": "FAKE_ACP_OK"}}))
+            extra = ""
+            if "ESCALATE" in text:
+                out({"jsonrpc": "2.0", "id": 900, "method": "session/request_permission",
+                     "params": {
+                         "sessionId": sid,
+                         "toolCall": {"toolCallId": "t1", "title": "write", "kind": "edit"},
+                         "options": [
+                             {"optionId": "allow-once", "name": "Allow", "kind": "allow_once"},
+                             {"optionId": "reject-once", "name": "Reject", "kind": "reject_once"},
+                         ]}})
+                answer = sys.stdin.readline()
+                if answer.strip():
+                    result = (json.loads(answer).get("result") or {})
+                    extra = " " + str(((result.get("outcome") or {}).get("optionId")))
+            if "SLOW" in text:
+                while True:
+                    line2 = sys.stdin.readline()
+                    if not line2:
+                        break
+                    msg2 = json.loads(line2)
+                    if (msg2.get("method") == "session/cancel"
+                            and (msg2.get("params") or {}).get("sessionId") == sid):
+                        cancelled.add(sid)
+                        break
+            if extra:
+                out(update(sid, "agent_message_chunk",
+                           {"content": {"type": "text", "text": extra}}))
+            stop = "cancelled" if sid in cancelled else "end_turn"
+            out({"jsonrpc": "2.0", "id": mid, "result": {"stopReason": stop}})
+            out(update(sid, "usage_update", {"used": 10, "size": 100}))
+        else:
+            out({"jsonrpc": "2.0", "id": mid,
+                 "error": {"code": -32601, "message": f"unknown method {method}"}})
+    return 0
+
+
 def main():
     args = sys.argv[1:]
     if "--profile" not in args:
@@ -121,6 +219,8 @@ def main():
         return headless(task)
     if profile == "sdk":
         return sdk()
+    if profile == "acp":
+        return acp()
     sys.stderr.write(f"fake dsh: unsupported profile {profile}\n")
     return 2
 

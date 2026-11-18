@@ -4,6 +4,8 @@ import json
 import os
 import stat
 import tempfile
+import threading
+import time
 import unittest
 from unittest import mock
 
@@ -30,8 +32,11 @@ class _Ctx:
         self.tools.append(kwargs["name"])
 
 
-def _call(action, **kwargs):
-    return json.loads(plugin.handle_dsh_session({"action": action, **kwargs}))
+def _call(action, transport="sdk", **kwargs):
+    payload = {"action": action, **kwargs}
+    if transport:
+        payload["transport"] = transport
+    return json.loads(plugin.handle_dsh_session(payload))
 
 
 class DshTestCase(unittest.TestCase):
@@ -46,9 +51,7 @@ class DshTestCase(unittest.TestCase):
         self.addCleanup(self._fake.stop)
 
     def _stop(self):
-        plugin.handle_dsh_session({"action": "shutdown"})
-        plugin._SESSIONS.clear()
-        plugin._SERVERS.clear()
+        plugin._shutdown_all()
 
     def start_session(self, **kwargs):
         result = _call("start", cwd=self.tmp, **kwargs)
@@ -220,6 +223,90 @@ class TestFanout(DshTestCase):
         self.assertTrue(out["ok"], out)
         routes = {(r["provider"], r["model"]) for r in out["results"]}
         self.assertIn(("deepseek-official", "deepseek-chat"), routes)
+
+
+class TestAcp(DshTestCase):
+    def start_acp(self):
+        out = _call("start", transport="acp", cwd=self.tmp)
+        self.assertTrue(out["ok"], out)
+        return out["session_id"]
+
+    def test_start_applies_route_and_reports_config(self):
+        out = _call("start", transport="acp", cwd=self.tmp)
+        self.assertTrue(out["ok"], out)
+        self.assertIsNone(out["config_errors"])
+        self.assertEqual(out["config"]["model"]["current"],
+                         '["deepseek-official","deepseek-chat"]')
+        self.assertEqual(out["config"]["reasoning_effort"]["current"], "max")
+
+    def test_prompt_returns_text_and_usage(self):
+        sid = self.start_acp()
+        out = _call("prompt", transport="acp", session_id=sid, task="hello")
+        self.assertTrue(out["ok"], out)
+        self.assertEqual(out["text"], "FAKE_ACP_OK")
+        self.assertEqual(out["stop_reason"], "end_turn")
+        self.assertEqual(out["usage"], {"used": 10, "size": 100})
+
+    def test_approval_ask_refuses_and_surfaces(self):
+        sid = self.start_acp()
+        out = _call("prompt", transport="acp", session_id=sid, task="ESCALATE")
+        self.assertEqual(out["pending_approvals"][0]["decision"], "needs-user")
+        self.assertIn("reject-once", out["text"])
+        self.assertTrue(out["guidance"])
+
+    def test_approval_allow_grants_once(self):
+        sid = self.start_acp()
+        out = _call("prompt", transport="acp", session_id=sid, task="ESCALATE",
+                    approval="allow")
+        self.assertEqual(out["approvals"][0]["option"], "allow_once")
+        self.assertIn("allow-once", out["text"])
+
+    def test_cancel_stops_the_turn(self):
+        sid = self.start_acp()
+        box = {}
+
+        def run():
+            box.update(_call("prompt", transport="acp", session_id=sid,
+                             task="SLOW", timeout_s=60))
+
+        thread = threading.Thread(target=run)
+        thread.start()
+        time.sleep(0.5)
+        cancelled = _call("cancel", transport="acp", session_id=sid)
+        self.assertTrue(cancelled["ok"], cancelled)
+        thread.join(30)
+        self.assertEqual(box.get("stop_reason"), "cancelled")
+        self.assertTrue(box.get("ok"), box)
+
+    def test_events_cursor_advances(self):
+        sid = self.start_acp()
+        _call("prompt", transport="acp", session_id=sid, task="hello")
+        first = _call("events", transport="acp", session_id=sid, since_seq=0)
+        self.assertTrue(first["ok"], first)
+        self.assertGreater(first["next_seq"], 0)
+        self.assertTrue(first["events"])
+        second = _call("events", transport="acp", session_id=sid,
+                       since_seq=first["next_seq"])
+        self.assertEqual(second["events"], [])
+
+    def test_config_set_changes_current_value(self):
+        sid = self.start_acp()
+        out = _call("config", transport="acp", session_id=sid,
+                    config_id="reasoning_effort", value="low")
+        self.assertTrue(out["ok"], out)
+        self.assertEqual(out["config"]["reasoning_effort"]["current"], "low")
+
+    def test_fanout_runs_two_sessions(self):
+        out = _call("fanout", transport="acp", cwd=self.tmp, tasks=["one", "two"])
+        self.assertTrue(out["ok"], out)
+        self.assertEqual(out["agents"], 2)
+        self.assertEqual([r["text"] for r in out["results"]], ["FAKE_ACP_OK"] * 2)
+
+    def test_cwd_set_is_rejected(self):
+        sid = self.start_acp()
+        out = _call("cwd", transport="acp", session_id=sid, path=self.tmp)
+        self.assertFalse(out["ok"])
+        self.assertIn("binds the working directory", out["error"])
 
 
 if __name__ == "__main__":

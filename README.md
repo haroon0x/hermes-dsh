@@ -26,7 +26,12 @@ Two surfaces:
 | | transport | use it for |
 | --- | --- | --- |
 | `dsh_agent` | `dsh --profile headless --json` | fire and forget, no live control |
-| `dsh_session` | `dsh --profile sdk` (JSON-RPC over stdio) | multi-turn work, approvals, parallel agents |
+| `dsh_session` | `dsh --profile acp` by default | multi-turn work, cancel, approvals, model config, parallel agents |
+
+`dsh_session` speaks ACP, the same protocol the dsh UI uses. That buys real
+per-turn cancel, permission requests, and the session's own model and reasoning
+catalog. Pass `transport="sdk"` to use the older JSON-RPC automation runtime
+instead; it has no cancel.
 
 ## Install
 
@@ -116,18 +121,21 @@ The `headless` profile owns the model route. This tool does not pick a model.
 
 | action | what it does |
 | --- | --- |
-| `start` | new session in `cwd`, returns `session_id` |
-| `prompt` | send a turn, wait for `turn/end`, return answer and tool calls |
+| `start` | new session in `cwd`, applies the route, returns `session_id` and config |
+| `prompt` | send a turn, wait for the stop reason, return text, tools and usage |
 | `fanout` | run several independent agents concurrently |
-| `events` | read the session's event stream since `since_seq` |
+| `events` | read the session's update stream since `since_seq` |
+| `cancel` | stop the running turn (ACP only) |
 | `resume` | reattach a persisted dsh session id |
-| `cwd` | read the session directory, or change it with `path` |
-| `list` | live sessions, their route, cwd, status, and age |
+| `cwd` | read the session directory (ACP binds it at creation) |
+| `config` | read the model and reasoning catalog, or set one option |
+| `list` | live sessions, their route, cwd, status, and update count |
 | `shutdown` | stop every runtime this plugin started |
 
-A prompt returns the last assistant text, every tool call (name plus a truncated
-argument string), reasoning character count, event count, turn count, and the
-approval decisions for that session.
+A prompt returns the last assistant text, every tool call (title, kind, status,
+arguments), reasoning character count, update count, usage, and the approval
+decisions for that session. On ACP a timed-out prompt sends `session/cancel`
+before returning, so the turn actually stops.
 
 ### Approvals
 
@@ -136,7 +144,7 @@ dsh asks before it steps outside its sandbox. `approval` decides the answer:
 | value | behaviour |
 | --- | --- |
 | `ask` (default) | refuse, record in `pending_approvals`, return guidance |
-| `allow` | grant `allowed-once` for that one operation |
+| `allow` | grant once for that one operation (ACP `allow_once`) |
 | `reject` | refuse |
 
 Grants never persist past the operation. The plugin never approves on its own,
@@ -144,10 +152,12 @@ and an approval in one session never covers another session.
 
 ### User questions
 
-`ask_user_question` goes to whoever drives the runtime, which here is Hermes,
-not a person. The plugin answers `{cancelled: true}` (a dismissal is not
+On the SDK runtime, `ask_user_question` goes to whoever drives it, which here is
+Hermes, not a person. The plugin answers `{cancelled: true}` (a dismissal is not
 permission), returns the question in `pending_questions`, and the model asks
-you. Your answer goes back as the next prompt on that session.
+you. Your answer goes back as the next prompt on that session. The ACP runtime
+has no equivalent request in this dsh build, so `pending_questions` is empty
+there.
 
 ## Fanout
 
@@ -170,17 +180,17 @@ dsh_session(
 fanout mix a cheap model for bulk work with a stronger one for review.
 
 Results come back in task order, each with `ok`, `session_id`, `text`,
-`tool_calls`, `turns`, and `approvals`. Failures do not abort the batch: you get
-`failed: n` and the per-agent error.
+`tool_calls`, `stop_reason`, `usage`, and `approvals`. Failures do not abort the
+batch: you get `failed: n` and the per-agent error.
 
 ## Watching progress
 
-`prompt` blocks until `turn/end`, which is fine for short tasks and useless for
-long ones. Poll instead:
+`prompt` blocks until the turn stops, which is fine for short tasks and useless
+for long ones. Poll instead:
 
 ```
 dsh_session(action="events", session_id=..., since_seq=0)
-  events:   [turn/start, step/start, tool/call, ...]
+  events:   [agent_thought_chunk, tool_call, tool_call_update, ...]
   next_seq: 42
   status:   working
 
@@ -189,9 +199,20 @@ dsh_session(action="events", session_id=..., since_seq=42)
   next_seq: 42
 ```
 
-Event types are dsh's own: `turn/start`, `step/start`, `tool/call`,
-`tool/result`, `assistant/message`, `turn/end`. The cursor is monotonic per
-session, so passing `next_seq` never replays.
+ACP updates are dsh's own: `agent_thought_chunk`, `agent_message_chunk`,
+`tool_call`, `tool_call_update`, `usage_update`. The SDK transport streams its
+own event names (`turn/start`, `step/start`, `tool/call`, `turn/end`). The
+cursor is monotonic per session, so passing `next_seq` never replays.
+
+## Cancel
+
+```
+dsh_session(action="cancel", session_id=...)
+```
+
+Sends ACP `session/cancel`; the in-flight `prompt` returns
+`stop_reason: "cancelled"` instead of running to completion. A timeout in
+`prompt` does the same thing automatically before returning partial results.
 
 ## Configuration
 
@@ -207,8 +228,9 @@ plugins:
         idle_timeout_s: 900             # 0 disables the idle reaper
 ```
 
-`route` is what `dsh_session` asks the SDK runtime to use. The `headless`
-profile owns its own route; this setting does not change it.
+`route` is what `dsh_session` asks the ACP session to use, by setting the
+session's model and reasoning options at start. The `headless` profile owns its
+own route; this setting does not change it.
 
 Credentials are never stored or read from files by the plugin. It passes the
 environment through to dsh and resolves provider keys with
@@ -222,10 +244,11 @@ key.
 - Hermes `>= 0.22`, Python `3.10+`, Linux or macOS
 - a dsh profile that resolves to a provider with a key
 
-The `headless` profile and the `sdk` profile both need the provider adapter
-mounted in `~/.dsh/profiles/<profile>/cordis.patch.yml`. If the SDK runtime
-fails with `no adapter registered for provider`, that file is missing the
-`llm-pi-ai` provider block. This plugin does not write dsh profiles.
+The `headless`, `acp`, and `sdk` profiles each need the provider adapter mounted
+in `~/.dsh/profiles/<profile>/cordis.patch.yml`. If a runtime fails with
+`no adapter registered for provider` or `no API key for provider route`, that
+file is missing the `llm-pi-ai` provider block. This plugin does not write dsh
+profiles.
 
 ## Design
 
@@ -235,26 +258,34 @@ Hermes tool call
    +-- dsh_agent  ---> dsh --profile headless --json "task"
    |                    NDJSON events on stdout, one process per run
    |
-   +-- dsh_session --> dsh --profile sdk
-                        newline-delimited JSON-RPC on stdio
-                        server: deepseek-harness-sdk-runtime
-                        sessions: N per runtime, concurrent
-                        routes:   one runtime per provider/model/effort
+   +-- dsh_session --> dsh --profile acp          (default)
+   |                    ACP over newline-delimited JSON-RPC
+   |                    session/new, prompt, cancel, request_permission
+   |                    one runtime, many sessions, model per session
+   |
+   +-- dsh_session --> dsh --profile sdk          (transport="sdk")
+                        JSON-RPC automation runtime
+                        no cancel, one runtime per route
 ```
 
-Why the SDK instead of `dsh web`? The web profile is a long-running browser UI;
-its `/api` is that UI's transport, behind a browser-trust fence, and it never
-exits, so it cannot be a one-shot target. The SDK is dsh's documented automation
-surface and the same runtime the UI drives.
+Why ACP? It is the surface the dsh UI itself drives: per-turn cancel,
+permission requests, and the session's own model catalog. The older SDK runtime
+has no cancel, so it stays as a fallback.
+
+Why not `dsh web`? It is a long-running browser UI; its `/api` is that UI's
+transport, behind a browser-trust fence, and it never exits, so it cannot be a
+one-shot target.
 
 ## Limitations
 
-- The SDK has no per-turn cancel. A prompt that times out keeps running inside
-  dsh; only `shutdown` stops it, and that stops every session on the runtime.
+- The SDK transport has no per-turn cancel. ACP does: `cancel` stops the running
+  turn and the prompt returns `stop_reason: cancelled`.
+- ACP binds the working directory when a session is created. To work elsewhere,
+  start a new session or resume this one with the new `cwd`.
 - Sessions live in the runtime process. Across a Hermes restart, only `resume`
   with a persisted dsh session id brings one back.
-- One runtime per route. Sessions on that route share it and run concurrently,
-  up to `max_parallel` per fanout call.
+- One ACP runtime hosts every session; each session carries its own model and
+  effort. The SDK transport needs one runtime per route.
 - `dsh --profile web` is not a valid target, for the reason above.
 
 ## What it runs
@@ -272,9 +303,10 @@ python3 -m unittest discover -s tests -v
 hermes plugins validate .
 ```
 
-The tests use a fake `dsh` executable (`tests/fake_dsh.py`) that emits the same
-NDJSON and JSON-RPC shapes as the real CLI, so they run offline without dsh or a
-DeepSeek key. CI runs them on Ubuntu and macOS against Python 3.10 and 3.13.
+The tests use a fake `dsh` executable (`tests/fake_dsh.py`) that speaks the same
+headless NDJSON, SDK JSON-RPC, and ACP shapes as the real CLI, so they run
+offline without dsh or a DeepSeek key. CI runs them on Ubuntu and macOS against
+Python 3.10 and 3.13.
 
 ## License
 
