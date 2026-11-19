@@ -103,7 +103,7 @@ follow-up questions, or feed its answer into another agent.
   cleans up when Hermes exits.
 - **Resumable sessions.** Keep the dsh session id and `resume` it after a
   restart.
-- **Offline tests.** 42 tests against a fake `dsh` binary, no key needed.
+- **Offline tests.** 43 tests against a fake `dsh` binary, no key needed.
 
 ## dsh_agent
 
@@ -157,7 +157,9 @@ cannot hand itself a dsh escalation: a `dsh_session` call with `approval="allow"
 goes through the plugin's `pre_tool_call` hook, which escalates it to Hermes'
 human-approval gate (once/session/always/deny, timeout fails closed). Cron
 honors `approvals.cron_mode`, and any other unattended context without an
-approval bridge blocks the call. An approval in one session never covers
+approval bridge blocks the call. As with every Hermes approval, the gate is
+skipped only when approvals are explicitly turned off globally
+(`approvals.mode: off` or `--yolo`). An approval in one session never covers
 another session.
 
 ### User questions
@@ -244,8 +246,10 @@ own route; this setting does not change it.
 
 Credentials are never stored or read from files by the plugin. It builds the
 dsh child environment from an explicit allowlist instead of inheriting the
-launcher's: PATH, HOME, shell/terminal/locale settings, temp dir, `NODE_*`,
-`XDG_*`, `DSH_*` and proxy variables. Provider keys are resolved with
+launcher's: PATH, HOME, shell/terminal/locale settings, temp dir, TLS certs,
+`NODE_*`, `XDG_*`, `LC_*`, `DSH_HOME`/`DSH_TELEMETRY_DISABLED` and proxy
+variables. Credential-shaped names are skipped even inside the prefixes, so an
+npm `NODE_AUTH_TOKEN` does not ride along. Provider keys are resolved with
 `agent.secret_scope.get_secret` (`DEEPSEEK_API_KEY`, `OPENCODE_GO_API_KEY`,
 `OPENCODE_API_KEY`) and only those configured key variables cross into the
 child, so a multi-profile gateway does not leak another profile's key or any

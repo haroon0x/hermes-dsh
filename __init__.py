@@ -17,6 +17,7 @@ import atexit
 import glob
 import json
 import os
+import re
 import shutil
 import subprocess
 import threading
@@ -105,6 +106,10 @@ _ENV_PASSTHROUGH = frozenset({
     "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY",
 })
 _ENV_PREFIXES = ("LC_", "NODE_", "XDG_")
+# Prefix-matched names are host runtime/config knobs, never credential slots, but
+# npm and friends do smuggle secrets through generic prefixes (NODE_AUTH_TOKEN),
+# so credential-shaped names are skipped unless they are explicitly allowed.
+_ENV_SENSITIVE = re.compile(r"(?:KEY|PASSWORD|PASSWD|SECRET|TOKEN|CREDENTIAL)", re.IGNORECASE)
 # Provider credentials this plugin documents and may hand to dsh; each is
 # resolved by name and only when configured, never inherited wholesale.
 _PROVIDER_KEY_ENVS = ("OPENCODE_GO_API_KEY", "OPENCODE_API_KEY", "DEEPSEEK_API_KEY")
@@ -123,9 +128,10 @@ def _child_env(binary: str | None = None) -> dict[str, str]:
     """Build the environment for a spawned dsh process.
 
     Starts from an allowlist of non-secret host variables (PATH, HOME, locale,
-    terminal, temp dir, TLS certs, NODE_*/XDG_*/LC_*, proxy settings and the
-    dsh home), then adds only the provider key variables this plugin resolves by
-    name. The dsh profile names the key it needs (``OPENCODE_GO_API_KEY``,
+    terminal, temp dir, TLS certs, NODE_*/XDG_*/LC_* knobs, proxy settings and
+    the dsh home), skipping credential-shaped names even inside those prefixes,
+    then adds only the provider key variables this plugin resolves by name. The
+    dsh profile names the key it needs (``OPENCODE_GO_API_KEY``,
     ``OPENCODE_API_KEY``, or ``DEEPSEEK_API_KEY``); Hermes credentials live in
     the active profile's secret scope, so they are read with
     ``agent.secret_scope.get_secret`` instead of from ``.env`` files. Nothing
@@ -134,7 +140,8 @@ def _child_env(binary: str | None = None) -> dict[str, str]:
     env = {
         name: value
         for name, value in os.environ.items()
-        if name in _ENV_PASSTHROUGH or name.startswith(_ENV_PREFIXES)
+        if name in _ENV_PASSTHROUGH
+        or (name.startswith(_ENV_PREFIXES) and not _ENV_SENSITIVE.search(name))
     }
     if binary:
         # `_find_dsh` can locate dsh outside PATH (the nvm glob fallback), but
@@ -422,7 +429,7 @@ SDK_SCHEMA = {
 _DEFAULT_PROVIDER = "deepseek-official"
 _DEFAULT_MODEL = "deepseek-chat"
 _DEFAULT_EFFORT = "max"
-_PLUGIN_VERSION = "2.0.1"
+_PLUGIN_VERSION = "2.0.2"
 
 
 class _SdkError(RuntimeError):

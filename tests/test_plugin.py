@@ -362,21 +362,24 @@ class TestChildEnv(DshTestCase):
             "PATH": "/usr/bin", "HOME": "/home/tester", "SHELL": "/bin/zsh",
             "TERM": "xterm-256color", "LANG": "en_US.UTF-8", "LC_ALL": "en_US.UTF-8",
             "TMPDIR": "/tmp/tester", "NODE_EXTRA_CA_CERTS": "/tmp/ca.pem",
+            "NODE_OPTIONS": "--max-old-space-size=4096",
             "SSL_CERT_FILE": "/tmp/cert.pem", "XDG_CONFIG_HOME": "/x/cfg",
             "DSH_HOME": "/x/dsh", "HTTPS_PROXY": "http://proxy:3128",
             "OPENCODE_GO_API_KEY": "go-key",
             "ANTHROPIC_API_KEY": "must-not-leak", "AWS_SECRET_ACCESS_KEY": "must-not-leak",
             "GITHUB_TOKEN": "must-not-leak", "HERMES_OPENAI_KEY": "must-not-leak",
+            "NODE_AUTH_TOKEN": "must-not-leak",
         }
         with mock.patch.dict(os.environ, fake, clear=True), \
                 mock.patch.object(plugin, "_secret", return_value=None):
             env = plugin._child_env()
         for name in ("PATH", "HOME", "SHELL", "TERM", "LANG", "LC_ALL", "TMPDIR",
-                     "NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE", "XDG_CONFIG_HOME",
-                     "DSH_HOME", "HTTPS_PROXY", "OPENCODE_GO_API_KEY"):
+                     "NODE_EXTRA_CA_CERTS", "NODE_OPTIONS", "SSL_CERT_FILE",
+                     "XDG_CONFIG_HOME", "DSH_HOME", "HTTPS_PROXY",
+                     "OPENCODE_GO_API_KEY"):
             self.assertEqual(env.get(name), fake[name], name)
         for name in ("ANTHROPIC_API_KEY", "AWS_SECRET_ACCESS_KEY", "GITHUB_TOKEN",
-                     "HERMES_OPENAI_KEY"):
+                     "HERMES_OPENAI_KEY", "NODE_AUTH_TOKEN"):
             self.assertNotIn(name, env)
 
     def test_resolves_one_configured_provider_key_from_the_secret_scope(self):
@@ -419,6 +422,19 @@ class TestChildEnv(DshTestCase):
             out = json.loads(plugin.handle_dsh_agent({"task": "hi", "cwd": self.tmp}))
         self.assertTrue(out["ok"], out)
         self.assertEqual(captured["env"], {"PATH": "/x"})
+
+    def test_sdk_and_acp_spawns_use_the_filtered_environment(self):
+        # A refused spawn still shows what the constructor handed to Popen.
+        for build in (lambda: plugin._SdkServer("p", "m", "max", self.tmp),
+                      lambda: plugin._AcpServer()):
+            with mock.patch.object(plugin, "_child_env",
+                                   return_value={"PATH": "/x"}) as env_fn, \
+                    mock.patch.object(plugin.subprocess, "Popen",
+                                      side_effect=OSError("spawn refused")):
+                with self.assertRaises(OSError):
+                    build()
+            env_fn.assert_called_once_with(FAKE)
+            self.assertEqual(env_fn.call_args.args[0], FAKE)
 
 
 if __name__ == "__main__":
