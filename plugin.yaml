@@ -1,5 +1,5 @@
 name: dsh
-version: 2.0.0
+version: 2.0.1
 description: "Drive DeepSeek Harness (dsh) agents from Hermes: one-shot headless runs and live ACP sessions with per-turn cancel, permissions, model config, parallel fanout, and resumable sessions."
 author: haroon0x
 kind: standalone
@@ -10,3 +10,5 @@ requires_hermes: ">=0.22"
 provides_tools:
   - dsh_agent
   - dsh_session
+provides_hooks:
+  - pre_tool_call

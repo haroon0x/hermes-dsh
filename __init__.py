@@ -2,8 +2,10 @@
 
 Registers two tools: ``dsh_agent``, a one-shot run over
 ``dsh --profile headless --json``, and ``dsh_session``, live control over
-``dsh --profile sdk`` (JSON-RPC) with sessions, streaming events, approvals,
-parallel fanout, and resumable ids.
+``dsh --profile acp`` by default (per-turn cancel, permissions, model config)
+with sessions, streaming events, approvals, parallel fanout, and resumable ids.
+The older ``dsh --profile sdk`` JSON-RPC runtime stays available behind
+``transport="sdk"``.
 
 The dsh profile owns the model route; this plugin only overrides it when a
 caller passes provider/model explicitly.
@@ -83,26 +85,68 @@ def _check_available() -> bool:
     return _find_dsh() is not None
 
 
-def _env_with_keys() -> dict[str, str]:
-    """Inherit the environment, then resolve provider keys through Hermes' secret scope.
+# Environment for a spawned dsh process.
+#
+# Copying os.environ wholesale would hand every credential Hermes loaded
+# (unrelated providers' keys, cloud tokens) to the dsh binary. dsh only needs a
+# small, non-secret slice of the launcher environment, and the provider key for
+# its model route, so the child gets an explicit allowlist.
+_ENV_PASSTHROUGH = frozenset({
+    # Process essentials and locale; dsh's own child scrub keeps the same set.
+    "PATH", "HOME", "SHELL", "TERM", "LANG", "LANGUAGE", "TZ",
+    "TMPDIR", "TMP", "TEMP",
+    # TLS material for the node runtime and the CLIs dsh spawns.
+    "NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE", "SSL_CERT_DIR",
+    "CURL_CA_BUNDLE", "REQUESTS_CA_BUNDLE",
+    # The harness home and privacy switch dsh resolves at boot.
+    "DSH_HOME", "DSH_TELEMETRY_DISABLED",
+    # dsh-http-proxy resolves the machine's network policy from these.
+    "http_proxy", "https_proxy", "no_proxy", "all_proxy",
+    "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY",
+})
+_ENV_PREFIXES = ("LC_", "NODE_", "XDG_")
+# Provider credentials this plugin documents and may hand to dsh; each is
+# resolved by name and only when configured, never inherited wholesale.
+_PROVIDER_KEY_ENVS = ("OPENCODE_GO_API_KEY", "OPENCODE_API_KEY", "DEEPSEEK_API_KEY")
 
-    The dsh profile names the env var it needs (for example ``OPENCODE_GO_API_KEY``
-    or ``DEEPSEEK_API_KEY``); dsh inherits it from the launching environment.
-    Hermes credentials live in the active profile's secret scope, so resolve them
-    with ``agent.secret_scope.get_secret`` instead of reading ``.env`` files.
-    """
-    env = dict(os.environ)
+
+def _secret(name: str) -> str | None:
+    """Read one Hermes profile secret, or None when the host isn't available."""
     try:
         from agent.secret_scope import get_secret
+        return get_secret(name)
     except Exception:
-        return env
-    for name in ("OPENCODE_GO_API_KEY", "OPENCODE_API_KEY", "DEEPSEEK_API_KEY"):
-        if env.get(name):
-            continue
-        try:
-            value = get_secret(name)
-        except Exception:
-            continue
+        return None
+
+
+def _child_env(binary: str | None = None) -> dict[str, str]:
+    """Build the environment for a spawned dsh process.
+
+    Starts from an allowlist of non-secret host variables (PATH, HOME, locale,
+    terminal, temp dir, TLS certs, NODE_*/XDG_*/LC_*, proxy settings and the
+    dsh home), then adds only the provider key variables this plugin resolves by
+    name. The dsh profile names the key it needs (``OPENCODE_GO_API_KEY``,
+    ``OPENCODE_API_KEY``, or ``DEEPSEEK_API_KEY``); Hermes credentials live in
+    the active profile's secret scope, so they are read with
+    ``agent.secret_scope.get_secret`` instead of from ``.env`` files. Nothing
+    else from the launcher environment is inherited.
+    """
+    env = {
+        name: value
+        for name, value in os.environ.items()
+        if name in _ENV_PASSTHROUGH or name.startswith(_ENV_PREFIXES)
+    }
+    if binary:
+        # `_find_dsh` can locate dsh outside PATH (the nvm glob fallback), but
+        # the dsh launcher runs through `#!/usr/bin/env node`; keep its own
+        # directory first so that lookup works.
+        bin_dir = os.path.dirname(os.path.abspath(binary))
+        if bin_dir:
+            path = env.get("PATH") or ""
+            if bin_dir not in path.split(os.pathsep):
+                env["PATH"] = bin_dir + (os.pathsep + path if path else "")
+    for name in _PROVIDER_KEY_ENVS:
+        value = os.environ.get(name) or _secret(name)
         if value:
             env[name] = value
     return env
@@ -153,7 +197,7 @@ def handle_dsh_agent(args: dict[str, Any], **_kw) -> str:
         proc = subprocess.run(
             cmd,
             cwd=cwd,
-            env=_env_with_keys(),
+            env=_child_env(binary),
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -365,7 +409,8 @@ SDK_SCHEMA = {
                 "enum": ["ask", "allow", "reject"],
                 "description": "How to answer dsh tool-approval requests during this "
                                "prompt. ask (default): refuse the escalation and return it "
-                               "so the user can decide; allow: grant allowed-once; reject: "
+                               "so the user can decide; allow: grant allowed-once, only "
+                               "after Hermes asks the user to confirm the call; reject: "
                                "refuse. Grants never persist.",
             },
         },
@@ -377,7 +422,7 @@ SDK_SCHEMA = {
 _DEFAULT_PROVIDER = "deepseek-official"
 _DEFAULT_MODEL = "deepseek-chat"
 _DEFAULT_EFFORT = "max"
-_PLUGIN_VERSION = "2.0.0"
+_PLUGIN_VERSION = "2.0.1"
 
 
 class _SdkError(RuntimeError):
@@ -422,7 +467,7 @@ class _SdkServer:
             errors="replace",
             bufsize=1,
             cwd=cwd,
-            env=_env_with_keys(),
+            env=_child_env(binary),
         )
         threading.Thread(target=self._read_loop, daemon=True).start()
         threading.Thread(target=self._stderr_loop, daemon=True).start()
@@ -851,6 +896,32 @@ def _approval_arg(args: dict[str, Any]) -> str:
     return value if value in {"ask", "allow", "reject"} else "ask"
 
 
+def _pre_tool_call(tool_name: str, args: dict[str, Any] | None = None,
+                   **kwargs: Any) -> dict[str, Any] | None:
+    """Send ``dsh_session`` calls with ``approval="allow"`` through Hermes' approval prompt.
+
+    ``approval="allow"`` makes the plugin answer dsh's out-of-sandbox tool
+    escalations with allow-once, and the model controls that argument. Returning
+    an ``approve`` directive escalates the tool call to the same human gate as
+    Hermes' dangerous-command checks, so a person confirms it, cron honors
+    ``approvals.cron_mode``, and any other unattended context fails closed.
+    ``ask`` stays the default and never needs the gate.
+    """
+    if tool_name != "dsh_session" or not isinstance(args, dict):
+        return None
+    action = str(args.get("action") or "").strip().lower()
+    if action not in {"prompt", "fanout"}:
+        return None
+    if _approval_arg(args) != "allow":
+        return None
+    return {
+        "action": "approve",
+        "message": f"dsh_session(action={action}) with approval=\"allow\" lets the dsh "
+                   "agent grant its own out-of-sandbox tool escalations for this call.",
+        "rule_key": "dsh_session:approval=allow",
+    }
+
+
 _EFFORT_LEVELS = {
     "off": "off", "none": "off", "minimal": "off",
     "low": "low", "medium": "high", "high": "high",
@@ -897,7 +968,7 @@ class _AcpServer:
             encoding="utf-8",
             errors="replace",
             bufsize=1,
-            env=_env_with_keys(),
+            env=_child_env(binary),
         )
         threading.Thread(target=self._read_loop, daemon=True).start()
         threading.Thread(target=self._stderr_loop, daemon=True).start()
@@ -1607,6 +1678,7 @@ def register(ctx) -> None:
         _IDLE_TIMEOUT = max(0, min(86400, int(ctx.get_config("idle_timeout_s", _IDLE_TIMEOUT))))
     except (TypeError, ValueError):
         pass
+    ctx.register_hook("pre_tool_call", _pre_tool_call)
     ctx.register_tool(
         name="dsh_agent",
         toolset="dsh",

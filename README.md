@@ -89,8 +89,9 @@ follow-up questions, or feed its answer into another agent.
 - **Cancel that works.** `cancel` sends ACP `session/cancel`; the running turn
   stops and returns `stop_reason: cancelled`. Timeouts cancel too.
 - **Approvals that stay honest.** `ask` is the default: the plugin refuses the
-  escalation, returns `pending_approvals`, and lets the model put it to you.
-  Nothing is ever auto-approved.
+  escalation and returns `pending_approvals` for the model to put to you.
+  `allow` routes through Hermes' approval prompt first, so a person confirms it
+  and cron/unattended runs fail closed.
 - **Model config from the session.** `config` reads the provider/model/effort
   catalog dsh advertises instead of hardcoding a list.
 - **User questions surfaced, not swallowed.** On the SDK transport,
@@ -102,7 +103,7 @@ follow-up questions, or feed its answer into another agent.
   cleans up when Hermes exits.
 - **Resumable sessions.** Keep the dsh session id and `resume` it after a
   restart.
-- **Offline tests.** 30 tests against a fake `dsh` binary, no key needed.
+- **Offline tests.** 42 tests against a fake `dsh` binary, no key needed.
 
 ## dsh_agent
 
@@ -148,11 +149,16 @@ dsh asks before it steps outside its sandbox. `approval` decides the answer:
 | value | behaviour |
 | --- | --- |
 | `ask` (default) | refuse, record in `pending_approvals`, return guidance |
-| `allow` | grant once for that one operation (ACP `allow_once`) |
+| `allow` | grant once, after Hermes asks you to approve the call (denied in cron/unattended runs) |
 | `reject` | refuse |
 
-Grants never persist past the operation. The plugin never approves on its own,
-and an approval in one session never covers another session.
+Grants never persist past the operation. The model can set `approval`, but it
+cannot hand itself a dsh escalation: a `dsh_session` call with `approval="allow"`
+goes through the plugin's `pre_tool_call` hook, which escalates it to Hermes'
+human-approval gate (once/session/always/deny, timeout fails closed). Cron
+honors `approvals.cron_mode`, and any other unattended context without an
+approval bridge blocks the call. An approval in one session never covers
+another session.
 
 ### User questions
 
@@ -236,11 +242,14 @@ plugins:
 session's model and reasoning options at start. The `headless` profile owns its
 own route; this setting does not change it.
 
-Credentials are never stored or read from files by the plugin. It passes the
-environment through to dsh and resolves provider keys with
+Credentials are never stored or read from files by the plugin. It builds the
+dsh child environment from an explicit allowlist instead of inheriting the
+launcher's: PATH, HOME, shell/terminal/locale settings, temp dir, `NODE_*`,
+`XDG_*`, `DSH_*` and proxy variables. Provider keys are resolved with
 `agent.secret_scope.get_secret` (`DEEPSEEK_API_KEY`, `OPENCODE_GO_API_KEY`,
-`OPENCODE_API_KEY`), so a multi-profile gateway does not leak another profile's
-key.
+`OPENCODE_API_KEY`) and only those configured key variables cross into the
+child, so a multi-profile gateway does not leak another profile's key or any
+other secret Hermes holds.
 
 ## Requirements
 

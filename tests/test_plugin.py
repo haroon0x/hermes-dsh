@@ -3,6 +3,7 @@ import importlib.util
 import json
 import os
 import stat
+import subprocess
 import tempfile
 import threading
 import time
@@ -24,12 +25,16 @@ class _Ctx:
     def __init__(self, settings=None):
         self.settings = settings or {}
         self.tools = []
+        self.hooks = []
 
     def get_config(self, key, default=None):
         return self.settings.get(key, default)
 
     def register_tool(self, **kwargs):
         self.tools.append(kwargs["name"])
+
+    def register_hook(self, name, callback):
+        self.hooks.append((name, callback))
 
 
 def _call(action, transport="sdk", **kwargs):
@@ -62,6 +67,10 @@ class DshTestCase(unittest.TestCase):
 class TestRegistration(DshTestCase):
     def test_registers_both_tools(self):
         self.assertEqual(sorted(self.ctx.tools), ["dsh_agent", "dsh_session"])
+
+    def test_registers_the_pre_tool_call_hook(self):
+        self.assertEqual([name for name, _ in self.ctx.hooks], ["pre_tool_call"])
+        self.assertIs(self.ctx.hooks[0][1], plugin._pre_tool_call)
 
     def test_settings_override_route_defaults(self):
         ctx = _Ctx({"route.provider": "custom-provider", "route.model": "custom-model",
@@ -307,6 +316,109 @@ class TestAcp(DshTestCase):
         out = _call("cwd", transport="acp", session_id=sid, path=self.tmp)
         self.assertFalse(out["ok"])
         self.assertIn("binds the working directory", out["error"])
+
+
+class TestApprovalGate(DshTestCase):
+    def test_allow_escalates_to_the_human_approval_gate(self):
+        directive = plugin._pre_tool_call(
+            "dsh_session", {"action": "prompt", "approval": "allow"})
+        self.assertEqual(directive["action"], "approve")
+        self.assertIn("approval=\"allow\"", directive["message"])
+        self.assertIn("prompt", directive["message"])
+        self.assertTrue(directive["rule_key"])
+
+    def test_allow_is_normalized_before_gating(self):
+        directive = plugin._pre_tool_call(
+            "dsh_session", {"action": "fanout", "approval": "  ALLOW  "})
+        self.assertEqual(directive["action"], "approve")
+        self.assertIn("fanout", directive["message"])
+
+    def test_ask_and_reject_never_escalate(self):
+        for approval in ("ask", "reject", "", None):
+            args = {"action": "prompt"}
+            if approval is not None:
+                args["approval"] = approval
+            self.assertIsNone(plugin._pre_tool_call("dsh_session", args), approval)
+
+    def test_actions_without_dsh_approvals_are_not_gated(self):
+        for action in ("start", "events", "cancel", "config", "list", "shutdown",
+                       "resume", "cwd"):
+            self.assertIsNone(
+                plugin._pre_tool_call("dsh_session", {"action": action,
+                                                      "approval": "allow"}), action)
+
+    def test_other_tools_are_not_gated(self):
+        self.assertIsNone(plugin._pre_tool_call("terminal", {"approval": "allow"}))
+        self.assertIsNone(plugin._pre_tool_call("dsh_agent", {"approval": "allow"}))
+
+    def test_malformed_arguments_are_ignored(self):
+        self.assertIsNone(plugin._pre_tool_call("dsh_session", None))
+        self.assertIsNone(plugin._pre_tool_call("dsh_session", "not-a-dict"))
+
+
+class TestChildEnv(DshTestCase):
+    def test_allowlists_host_vars_and_drops_unrelated_secrets(self):
+        fake = {
+            "PATH": "/usr/bin", "HOME": "/home/tester", "SHELL": "/bin/zsh",
+            "TERM": "xterm-256color", "LANG": "en_US.UTF-8", "LC_ALL": "en_US.UTF-8",
+            "TMPDIR": "/tmp/tester", "NODE_EXTRA_CA_CERTS": "/tmp/ca.pem",
+            "SSL_CERT_FILE": "/tmp/cert.pem", "XDG_CONFIG_HOME": "/x/cfg",
+            "DSH_HOME": "/x/dsh", "HTTPS_PROXY": "http://proxy:3128",
+            "OPENCODE_GO_API_KEY": "go-key",
+            "ANTHROPIC_API_KEY": "must-not-leak", "AWS_SECRET_ACCESS_KEY": "must-not-leak",
+            "GITHUB_TOKEN": "must-not-leak", "HERMES_OPENAI_KEY": "must-not-leak",
+        }
+        with mock.patch.dict(os.environ, fake, clear=True), \
+                mock.patch.object(plugin, "_secret", return_value=None):
+            env = plugin._child_env()
+        for name in ("PATH", "HOME", "SHELL", "TERM", "LANG", "LC_ALL", "TMPDIR",
+                     "NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE", "XDG_CONFIG_HOME",
+                     "DSH_HOME", "HTTPS_PROXY", "OPENCODE_GO_API_KEY"):
+            self.assertEqual(env.get(name), fake[name], name)
+        for name in ("ANTHROPIC_API_KEY", "AWS_SECRET_ACCESS_KEY", "GITHUB_TOKEN",
+                     "HERMES_OPENAI_KEY"):
+            self.assertNotIn(name, env)
+
+    def test_resolves_one_configured_provider_key_from_the_secret_scope(self):
+        with mock.patch.dict(os.environ, {"PATH": "/usr/bin"}, clear=True), \
+                mock.patch.object(plugin, "_secret",
+                                  side_effect=lambda name: {
+                                      "OPENCODE_API_KEY": "opencode-key"}.get(name)):
+            env = plugin._child_env()
+        self.assertEqual(env["OPENCODE_API_KEY"], "opencode-key")
+        self.assertNotIn("OPENCODE_GO_API_KEY", env)
+        self.assertNotIn("DEEPSEEK_API_KEY", env)
+
+    def test_parent_environment_wins_over_the_secret_scope(self):
+        with mock.patch.dict(os.environ, {"PATH": "/usr/bin",
+                                          "DEEPSEEK_API_KEY": "from-shell"}, clear=True), \
+                mock.patch.object(plugin, "_secret", return_value="from-scope"):
+            env = plugin._child_env()
+        self.assertEqual(env["DEEPSEEK_API_KEY"], "from-shell")
+
+    def test_binary_directory_is_prepended_to_path(self):
+        with mock.patch.dict(os.environ, {"PATH": "/usr/bin"}, clear=True), \
+                mock.patch.object(plugin, "_secret", return_value=None):
+            env = plugin._child_env("/opt/node/bin/dsh")
+        self.assertEqual(env["PATH"], "/opt/node/bin" + os.pathsep + "/usr/bin")
+        # Already-present directories are not duplicated.
+        with mock.patch.dict(os.environ, {"PATH": "/opt/node/bin:/usr/bin"}, clear=True), \
+                mock.patch.object(plugin, "_secret", return_value=None):
+            self.assertEqual(plugin._child_env("/opt/node/bin/dsh")["PATH"],
+                             "/opt/node/bin:/usr/bin")
+
+    def test_spawned_dsh_gets_the_filtered_environment(self):
+        captured = {}
+
+        def fake_run(cmd, **kwargs):
+            captured.update(kwargs)
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        with mock.patch.object(plugin.subprocess, "run", side_effect=fake_run), \
+                mock.patch.object(plugin, "_child_env", return_value={"PATH": "/x"}):
+            out = json.loads(plugin.handle_dsh_agent({"task": "hi", "cwd": self.tmp}))
+        self.assertTrue(out["ok"], out)
+        self.assertEqual(captured["env"], {"PATH": "/x"})
 
 
 if __name__ == "__main__":
